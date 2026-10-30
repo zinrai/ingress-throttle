@@ -12,27 +12,29 @@ import shlex
 import subprocess
 import sys
 
-FILTER_PREF = "49152"
+# Not 49152, tc's default: a filter added without a pref gets 49152, or one
+# below the lowest pref in use, so it could never land on 65535.
+FILTER_PREF = "65535"
 FILTER_HANDLE = "1"
 IFB = "ifbthrottle0"
+
+
+def fail(args, proc):
+    msg = proc.stderr.strip() or f"exit status {proc.returncode}"
+    sys.exit(f"error: {shlex.join(args)}: {msg}")
 
 
 class Runner:
     def __init__(self, dry_run):
         self.dry_run = dry_run
 
-    def change(self, args, ok_if_fails=False):
+    def change(self, args):
         print(f"+ {shlex.join(args)}")
         if self.dry_run:
             return
         proc = subprocess.run(args, capture_output=True, text=True)
-        if proc.returncode == 0:
-            return
-        msg = proc.stderr.strip() or f"exit status {proc.returncode}"
-        if ok_if_fails:
-            print(f"  (ignored) {msg}")
-            return
-        sys.exit(f"error: {shlex.join(args)}: {msg}")
+        if proc.returncode != 0:
+            fail(args, proc)
 
     @staticmethod
     def show(args):
@@ -43,21 +45,40 @@ class Runner:
 
     @staticmethod
     def read_json(args):
+        # Not read as empty on failure: "off" would then skip deleting the
+        # redirect filter and leave it pointing at a deleted IFB device.
         proc = subprocess.run(args, capture_output=True, text=True)
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return []
-        return json.loads(proc.stdout)
+        if proc.returncode != 0:
+            fail(args, proc)
+        return json.loads(proc.stdout or "[]")
 
 
 def link_kind(name):
     """Return the link type of a device, "" if it has none, None if it is absent."""
-    links = Runner.read_json(["ip", "-j", "-d", "link", "show", "dev", name])
-    if not links:
-        return None
-    return links[0].get("linkinfo", {}).get("info_kind", "")
+    # All links are listed, as "show dev" fails both for an absent device and
+    # for any other error.
+    for link in Runner.read_json(["ip", "-j", "-d", "link", "show"]):
+        if link.get("ifname") == name:
+            return link.get("linkinfo", {}).get("info_kind", "")
+    return None
+
+
+def qdisc_kinds(interface):
+    qdiscs = Runner.read_json(["tc", "-j", "qdisc", "show", "dev", interface])
+    return {q.get("kind") for q in qdiscs}
+
+
+def ingress_filter_prefs(interface):
+    filters = Runner.read_json(
+        ["tc", "-j", "filter", "show", "dev", interface, "ingress"]
+    )
+    return {str(f.get("pref")) for f in filters}
 
 
 def cmd_on(args, run):
+    if link_kind(args.interface) is None:
+        sys.exit(f"error: {args.interface} does not exist")
+
     # Without numifbs=0, loading the module creates ifb0 and ifb1, which
     # nothing would remove.
     run.change(["modprobe", "ifb", "numifbs=0"])
@@ -86,13 +107,12 @@ def cmd_on(args, run):
         ]
     )
 
-    # Fails when an ingress or clsact qdisc already exists. Either one
-    # provides the ingress hook, so the existing one is used as is; replacing
-    # a clsact qdisc would drop its filters.
-    run.change(
-        ["tc", "qdisc", "add", "dev", args.interface, "handle", "ffff:", "ingress"],
-        ok_if_fails=True,
-    )
+    # An existing ingress or clsact qdisc provides the ingress hook, so it is
+    # used as is; replacing a clsact qdisc would drop its filters.
+    if not qdisc_kinds(args.interface) & {"ingress", "clsact"}:
+        run.change(
+            ["tc", "qdisc", "add", "dev", args.interface, "handle", "ffff:", "ingress"]
+        )
 
     # flower with no match keys matches every packet. Not matchall: it refuses
     # to replace an existing filter (File exists), so "on" could not run twice.
@@ -121,29 +141,29 @@ def cmd_on(args, run):
     )
 
 
-def cmd_off(args, run):
-    # Stop redirecting first, so traffic is never sent to a missing device.
+def remove_redirect(interface, run):
+    prefs = ingress_filter_prefs(interface)
     # Deleted by pref rather than flushing ingress, so other filters stay.
-    run.change(
-        ["tc", "filter", "del", "dev", args.interface, "ingress", "pref", FILTER_PREF],
-        ok_if_fails=True,
-    )
+    if FILTER_PREF in prefs:
+        run.change(
+            ["tc", "filter", "del", "dev", interface, "ingress", "pref", FILTER_PREF]
+        )
 
     # Remove the ingress qdisc only if it is a plain "ingress" qdisc with no
     # filters left. A clsact qdisc, or one still holding other filters,
     # belongs to someone else.
-    qdiscs = Runner.read_json(["tc", "-j", "qdisc", "show", "dev", args.interface])
-    kinds = {q.get("kind") for q in qdiscs}
-    filters = Runner.read_json(
-        ["tc", "-j", "filter", "show", "dev", args.interface, "ingress"]
-    )
-    others = [f for f in filters if str(f.get("pref")) != FILTER_PREF]
-    if "ingress" in kinds and not others:
-        run.change(
-            ["tc", "qdisc", "del", "dev", args.interface, "ingress"], ok_if_fails=True
-        )
-    elif others:
-        print(f"keeping ingress qdisc on {args.interface}: other filters remain")
+    if prefs - {FILTER_PREF}:
+        print(f"keeping ingress qdisc on {interface}: other filters remain")
+    elif "ingress" in qdisc_kinds(interface):
+        run.change(["tc", "qdisc", "del", "dev", interface, "ingress"])
+
+
+def cmd_off(args, run):
+    # Stop redirecting first, so traffic is never sent to a missing device.
+    if link_kind(args.interface) is None:
+        print(f"{args.interface} is gone: nothing to remove there")
+    else:
+        remove_redirect(args.interface, run)
 
     kind = link_kind(IFB)
     if kind == "ifb":

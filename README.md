@@ -17,10 +17,10 @@ $ sudo ingress-throttle.py on -i eth0 -r 300mbit
 + ip link set dev ifbthrottle0 up
 + tc qdisc replace dev ifbthrottle0 root cake bandwidth 300mbit besteffort ingress
 + tc qdisc add dev eth0 handle ffff: ingress
-+ tc filter replace dev eth0 ingress pref 49152 handle 1 protocol all flower action mirred egress redirect dev ifbthrottle0
++ tc filter replace dev eth0 ingress pref 65535 handle 1 protocol all flower action mirred egress redirect dev ifbthrottle0
 
 $ sudo ingress-throttle.py off -i eth0
-+ tc filter del dev eth0 ingress pref 49152
++ tc filter del dev eth0 ingress pref 65535
 + tc qdisc del dev eth0 ingress
 + ip link del dev ifbthrottle0
 ```
@@ -35,7 +35,7 @@ megabytes per second.
 between. `on` and `off` print each command they run; `--dry-run` prints them
 without running them.
 
-The tool only touches what it owns: its redirect filter (pref 49152) and the
+The tool only touches what it owns: its redirect filter (pref 65535) and the
 IFB device `ifbthrottle0`. An existing ingress or clsact qdisc is used as is,
 other ingress filters are left alone, and `off` removes the ingress qdisc only
 when it is a plain `ingress` qdisc with no other filters. A device of another
